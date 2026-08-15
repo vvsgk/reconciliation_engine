@@ -70,19 +70,29 @@ public class EventService {
 
         ReconciliationResult result = resolver.resolve(eventRepository.findByAccountIdOrderByTimestampAscEventIdAsc(request.accountId()));
 
+        // Use JDBC upsert pattern to reduce optimistic-lock contention on account row
         if (account == null) {
+            // Try to update first; if no row updated, try insert; if insert conflicts, another thread created it, so update.
             try {
-                account = new Account(request.accountId(), result.finalBalance(), request.currency(), now);
-                accountRepository.saveAndFlush(account);
-            } catch (org.springframework.dao.DataIntegrityViolationException ex) {
-                // Another thread created the account concurrently; re-load and update
-                account = accountRepository.findById(request.accountId()).orElseThrow();
-                account.update(result.finalBalance(), now);
-                accountRepository.saveAndFlush(account);
+                int updated = jdbcTemplate.update("UPDATE accounts SET balance=?, currency=?, updated_at=? WHERE account_id=?",
+                        result.finalBalance(), request.currency(), java.sql.Timestamp.from(now), request.accountId());
+                if (updated == 0) {
+                    try {
+                        jdbcTemplate.update("INSERT INTO accounts (account_id, balance, currency, updated_at) VALUES (?,?,?,?)",
+                                request.accountId(), result.finalBalance(), request.currency(), java.sql.Timestamp.from(now));
+                    } catch (org.springframework.dao.DataIntegrityViolationException ex) {
+                        // concurrent insert by other thread — fallthrough to update
+                        jdbcTemplate.update("UPDATE accounts SET balance=?, currency=?, updated_at=? WHERE account_id=?",
+                                result.finalBalance(), request.currency(), java.sql.Timestamp.from(now), request.accountId());
+                    }
+                }
+            } catch (org.springframework.dao.DataAccessException ex) {
+                throw ex;
             }
         } else {
-            account.update(result.finalBalance(), now);
-            accountRepository.saveAndFlush(account);
+            // Simple update for existing account
+            jdbcTemplate.update("UPDATE accounts SET balance=?, updated_at=? WHERE account_id=?",
+                    result.finalBalance(), java.sql.Timestamp.from(now), request.accountId());
         }
 
         // Save audit with richer fields and explanatory reason
