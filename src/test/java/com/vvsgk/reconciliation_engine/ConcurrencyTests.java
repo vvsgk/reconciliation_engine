@@ -25,11 +25,14 @@ public class ConcurrencyTests {
     @Autowired AuditRecordRepository auditRepository;
     @Autowired AccountRepository accountRepository;
 
+    @Autowired org.springframework.jdbc.core.JdbcTemplate jdbcTemplate;
+
     @BeforeEach
     void clearDb() {
-        auditRepository.deleteAll();
-        eventRepository.deleteAll();
-        accountRepository.deleteAll();
+        // Use native deletes to avoid JPA mapping issues from stale test artifacts
+        jdbcTemplate.execute("DELETE FROM audit_records");
+        jdbcTemplate.execute("DELETE FROM events");
+        jdbcTemplate.execute("DELETE FROM accounts");
     }
 
     @Test
