@@ -70,11 +70,11 @@ class ReconciliationEngineApplicationTests {
     void withinHourFixturePrefersHigherAmountAndCreatesAudit() throws Exception {
         for (EventRequest event : fixture("within-hour-conflict.json")) eventService.processEvent(event);
         var result = replayService.replay(new ReplayRequest("ACC-WINDOW", null)).reconciliation();
-        // With the new conflict-group policy this connected group spans > 1 hour,
-        // so the latest timestamp in the group wins.
-        assertEquals("WH-003", result.resolvedEvent().getEventId());
-        assertEquals(ResolutionMethod.LATEST_TIMESTAMP, result.resolutionMethod());
-        assertEquals(new BigDecimal("120.00"), result.finalBalance());
+        // PRD pairwise rule: <=1h compares by amount, >1h by timestamp.
+        // WH-001 vs WH-002 -> within 1h -> WH-002 (highest amount). WH-002 vs WH-003 -> within 1h -> WH-002 remains.
+        assertEquals("WH-002", result.resolvedEvent().getEventId());
+        assertEquals(ResolutionMethod.HIGHER_AMOUNT, result.resolutionMethod());
+        assertEquals(new BigDecimal("175.00"), result.finalBalance());
         assertEquals(3, auditRepository.count());
     }
 
