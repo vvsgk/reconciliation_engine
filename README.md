@@ -6,6 +6,8 @@
 
 A deterministic transaction-reconciliation service that accepts out-of-order account-state reports (events), decides the canonical account state per the product rule, stores a human-readable audit for each ingestion, and can replay history to reproduce state and a cryptographic fingerprint.
 
+> **Important:** The current development configuration references PostgreSQL credentials stored in a local/internal environment. **Before running or deploying this project, replace the database URL, username, and password with your own PostgreSQL credentials. Do not use the development credentials.** For deployment, use environment variables or a secrets manager and never commit real credentials to Git.
+
 Table of contents
 - Quickstart
 - Architecture & Policy (authoritative)
@@ -43,8 +45,8 @@ export SPRING_DATASOURCE_PASSWORD=REPLACE_WITH_STRONG_PASSWORD
 Architecture & policy (authoritative)
 The service implements a deterministic pairwise folding policy (the PRD):
 - For a candidate event and the next chronological event:
-  - If timestamp difference ≤ 1 hour → the event with the higher amount wins. Tie-breakers: earlier timestamp, then lexicographically smaller eventId.
-  - If timestamp difference > 1 hour → the later timestamp wins. Tie-breakers: higher amount, then lexicographically smaller eventId.
+    - If timestamp difference ≤ 1 hour → the event with the higher amount wins. Tie-breakers: earlier timestamp, then lexicographically smaller eventId.
+    - If timestamp difference > 1 hour → the later timestamp wins. Tie-breakers: higher amount, then lexicographically smaller eventId.
 
 This policy is applied in chronological order to produce a single resolved event for an account at any point in time. Replay uses the same algorithm and produces a canonical fingerprint (SHA-256) over policy version + canonical ordered events + result.
 
@@ -248,5 +250,3 @@ Fixtures are in `/fixtures/` and include combined complex scenarios (duplicates,
 - For large stress runs, prefer running on CI runners or dedicated benchmark machines and share measurements (p50/p95/p99, throughput, 409 rate).
 
 ## License
-
-(Include your preferred license here)
