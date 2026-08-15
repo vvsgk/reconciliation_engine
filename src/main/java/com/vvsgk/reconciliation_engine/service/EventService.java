@@ -61,18 +61,39 @@ public class EventService {
         Account account = accountRepository.findById(request.accountId()).orElse(null);
         if (account != null && !account.getCurrency().equals(request.currency())) throw new CurrencyMismatchException(request.accountId());
 
+        // Check for duplicate event ID before trying to insert
+        if (eventRepository.findEventIdExists(request.eventId()).isPresent()) {
+            throw new DuplicateEventException(request.eventId());
+        }
+
         try {
             eventRepository.saveAndFlush(event);
         } catch (org.springframework.dao.DataIntegrityViolationException ex) {
-            // Determine if this is a duplicate-key violation; translate to DuplicateEventException for 409
-            throw new DuplicateEventException(request.eventId());
+            // Check if this is a duplicate-key violation (race condition between check and insert)
+            String message = ex.getMessage();
+            Throwable cause = ex.getCause();
+            
+            boolean isDuplicate = false;
+            if (message != null && (message.contains("unique") || message.contains("duplicate") || message.contains("event_id"))) {
+                isDuplicate = true;
+            }
+            if (!isDuplicate && cause != null) {
+                String causeMessage = cause.getMessage();
+                if (causeMessage != null && (causeMessage.contains("unique") || causeMessage.contains("duplicate") || causeMessage.contains("event_id"))) {
+                    isDuplicate = true;
+                }
+            }
+            
+            if (isDuplicate) {
+                throw new DuplicateEventException(request.eventId());
+            }
+            throw ex;
         }
 
         ReconciliationResult result = resolver.resolve(eventRepository.findByAccountIdOrderByTimestampAscEventIdAsc(request.accountId()));
 
         // Use JDBC upsert pattern to reduce optimistic-lock contention on account row
         if (account == null) {
-            // Try to update first; if no row updated, try insert; if insert conflicts, another thread created it, so update.
             try {
                 int updated = jdbcTemplate.update("UPDATE accounts SET balance=?, currency=?, updated_at=? WHERE account_id=?",
                         result.finalBalance(), request.currency(), java.sql.Timestamp.from(now), request.accountId());
@@ -81,7 +102,6 @@ public class EventService {
                         jdbcTemplate.update("INSERT INTO accounts (account_id, balance, currency, updated_at) VALUES (?,?,?,?)",
                                 request.accountId(), result.finalBalance(), request.currency(), java.sql.Timestamp.from(now));
                     } catch (org.springframework.dao.DataIntegrityViolationException ex) {
-                        // concurrent insert by other thread — fallthrough to update
                         jdbcTemplate.update("UPDATE accounts SET balance=?, currency=?, updated_at=? WHERE account_id=?",
                                 result.finalBalance(), request.currency(), java.sql.Timestamp.from(now), request.accountId());
                     }
@@ -90,12 +110,10 @@ public class EventService {
                 throw ex;
             }
         } else {
-            // Simple update for existing account
             jdbcTemplate.update("UPDATE accounts SET balance=?, updated_at=? WHERE account_id=?",
                     result.finalBalance(), java.sql.Timestamp.from(now), request.accountId());
         }
 
-        // Save audit with richer fields and explanatory reason
         String reason = explainDecision(result, eventRepository.findByAccountIdOrderByTimestampAscEventIdAsc(request.accountId()));
         auditRecordRepository.save(new AuditRecord(now, request.accountId(), asJson(result.consideredEventIds()),
                 result.resolvedEvent().getEventId(), result.resolutionMethod().name(), result.finalBalance(),

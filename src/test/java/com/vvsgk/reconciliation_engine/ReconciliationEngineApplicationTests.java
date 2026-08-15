@@ -5,12 +5,14 @@ import com.vvsgk.reconciliation_engine.dto.EventRequest;
 import com.vvsgk.reconciliation_engine.dto.ReplayRequest;
 import com.vvsgk.reconciliation_engine.exception.CurrencyMismatchException;
 import com.vvsgk.reconciliation_engine.exception.DuplicateEventException;
+import com.vvsgk.reconciliation_engine.exception.GlobalExceptionHandler;
 import com.vvsgk.reconciliation_engine.reconciliation.ResolutionMethod;
 import com.vvsgk.reconciliation_engine.repository.AccountRepository;
 import com.vvsgk.reconciliation_engine.repository.AuditRecordRepository;
 import com.vvsgk.reconciliation_engine.repository.EventRepository;
 import com.vvsgk.reconciliation_engine.service.EventService;
 import com.vvsgk.reconciliation_engine.service.ReplayService;
+import com.vvsgk.reconciliation_engine.controller.EventController;
 import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -18,27 +20,31 @@ import java.util.Arrays;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
-import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-@SpringBootTest
-@ActiveProfiles("test")
-@AutoConfigureMockMvc
-class ReconciliationEngineApplicationTests {
+class ReconciliationEngineApplicationTests extends PostgresTestBase {
     @Autowired EventService eventService;
     @Autowired ReplayService replayService;
     @Autowired EventRepository eventRepository;
     @Autowired AccountRepository accountRepository;
     @Autowired AuditRecordRepository auditRepository;
     @Autowired ObjectMapper objectMapper;
-    @Autowired MockMvc mockMvc;
+    @Autowired EventController eventController;
+    
+    private MockMvc mockMvc;
+
+    @BeforeEach
+    void setup() {
+        mockMvc = MockMvcBuilders.standaloneSetup(eventController)
+                .setControllerAdvice(new GlobalExceptionHandler())
+                .build();
+        cleanDatabase();
+    }
 
     @BeforeEach
     void cleanDatabase() { auditRepository.deleteAll(); accountRepository.deleteAll(); eventRepository.deleteAll(); }

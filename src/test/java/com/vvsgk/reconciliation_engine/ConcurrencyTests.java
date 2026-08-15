@@ -8,7 +8,6 @@ import com.vvsgk.reconciliation_engine.repository.AccountRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.context.SpringBootTest;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -18,8 +17,7 @@ import java.util.concurrent.*;
 
 import static org.junit.jupiter.api.Assertions.*;
 
-@SpringBootTest
-public class ConcurrencyTests {
+public class ConcurrencyTests extends PostgresTestBase {
     @Autowired EventService eventService;
     @Autowired EventRepository eventRepository;
     @Autowired AuditRecordRepository auditRepository;
@@ -95,3 +93,4 @@ public class ConcurrencyTests {
         assertEquals(threads, successes);
     }
 }
+
