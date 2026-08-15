@@ -1,0 +1,5 @@
+[
+  {"eventId":"WH-001","timestamp":"2026-08-15T09:00:00Z","accountId":"ACC-WINDOW","amount":100.00,"currency":"EUR","source":"bank"},
+  {"eventId":"WH-002","timestamp":"2026-08-15T10:00:00Z","accountId":"ACC-WINDOW","amount":175.00,"currency":"EUR","source":"ledger"},
+  {"eventId":"WH-003","timestamp":"2026-08-15T10:15:00Z","accountId":"ACC-WINDOW","amount":120.00,"currency":"EUR","source":"gateway"}
+]

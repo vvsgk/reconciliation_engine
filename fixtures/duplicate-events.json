@@ -1,0 +1,4 @@
+[
+  {"eventId":"DUP-001","timestamp":"2026-08-15T09:00:00Z","accountId":"ACC-DUP","amount":100.00,"currency":"USD","source":"bank-a"},
+  {"eventId":"DUP-001","timestamp":"2026-08-15T09:01:00Z","accountId":"ACC-DUP","amount":125.00,"currency":"USD","source":"bank-a"}
+]
