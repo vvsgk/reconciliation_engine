@@ -15,6 +15,7 @@ import com.vvsgk.reconciliation_engine.repository.AccountRepository;
 import com.vvsgk.reconciliation_engine.repository.AuditRecordRepository;
 import com.vvsgk.reconciliation_engine.repository.EventRepository;
 import java.time.Instant;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -24,12 +25,14 @@ public class EventService {
     private final AccountRepository accountRepository;
     private final AuditRecordRepository auditRecordRepository;
     private final ObjectMapper objectMapper;
+    private final JdbcTemplate jdbcTemplate;
     private final ConflictResolver resolver = new ConflictResolver();
 
     public EventService(EventRepository eventRepository, AccountRepository accountRepository,
-                        AuditRecordRepository auditRecordRepository, ObjectMapper objectMapper) {
+                        AuditRecordRepository auditRecordRepository, ObjectMapper objectMapper, JdbcTemplate jdbcTemplate) {
         this.eventRepository = eventRepository; this.accountRepository = accountRepository;
         this.auditRecordRepository = auditRecordRepository; this.objectMapper = objectMapper;
+        this.jdbcTemplate = jdbcTemplate;
     }
 
     public EventResponse processEvent(EventRequest request) {
@@ -59,7 +62,8 @@ public class EventService {
         if (account != null && !account.getCurrency().equals(request.currency())) throw new CurrencyMismatchException(request.accountId());
 
         try {
-            eventRepository.saveAndFlush(event);
+            jdbcTemplate.update("INSERT INTO events (event_id, timestamp, account_id, amount, currency, source, created_at) VALUES (?,?,?,?,?,?,?)",
+                    event.getEventId(), java.sql.Timestamp.from(event.getTimestamp()), event.getAccountId(), event.getAmount(), event.getCurrency(), event.getSource(), java.sql.Timestamp.from(event.getCreatedAt()));
         } catch (org.springframework.dao.DataIntegrityViolationException ex) {
             throw new DuplicateEventException(request.eventId());
         }
