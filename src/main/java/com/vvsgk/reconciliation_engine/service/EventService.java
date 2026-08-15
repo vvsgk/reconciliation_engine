@@ -61,30 +61,17 @@ public class EventService {
         Account account = accountRepository.findById(request.accountId()).orElse(null);
         if (account != null && !account.getCurrency().equals(request.currency())) throw new CurrencyMismatchException(request.accountId());
 
-        // Check for duplicate event ID before trying to insert
-        if (eventRepository.findEventIdExists(request.eventId()).isPresent()) {
-            throw new DuplicateEventException(request.eventId());
-        }
-
         try {
             eventRepository.saveAndFlush(event);
-        } catch (org.springframework.dao.DataIntegrityViolationException ex) {
-            // Check if this is a duplicate-key violation (race condition between check and insert)
-            String message = ex.getMessage();
-            Throwable cause = ex.getCause();
-            
-            boolean isDuplicate = false;
-            if (message != null && (message.contains("unique") || message.contains("duplicate") || message.contains("event_id"))) {
-                isDuplicate = true;
-            }
-            if (!isDuplicate && cause != null) {
-                String causeMessage = cause.getMessage();
-                if (causeMessage != null && (causeMessage.contains("unique") || causeMessage.contains("duplicate") || causeMessage.contains("event_id"))) {
-                    isDuplicate = true;
-                }
+        } catch (Exception ex) {
+            // Log all exceptions to understand what's happening
+            System.err.println("Exception caught: " + ex.getClass().getName() + " - " + ex.getMessage());
+            if (ex.getCause() != null) {
+                System.err.println("Cause: " + ex.getCause().getClass().getName() + " - " + ex.getCause().getMessage());
             }
             
-            if (isDuplicate) {
+            // Unique constraint violation on event_id → duplicate event
+            if (isDuplicateViolation(ex)) {
                 throw new DuplicateEventException(request.eventId());
             }
             throw ex;
@@ -142,5 +129,18 @@ public class EventService {
     private String asJson(Object value) {
         try { return objectMapper.writeValueAsString(value); }
         catch (JacksonException ex) { throw new IllegalStateException("Unable to serialize audit event IDs", ex); }
+    }
+
+    private boolean isDuplicateViolation(Throwable ex) {
+        if (ex == null) return false;
+        String message = ex.getMessage();
+        if (message != null && (message.contains("unique") || message.contains("duplicate") || message.contains("event_id"))) {
+            return true;
+        }
+        Throwable cause = ex.getCause();
+        if (cause != null) {
+            return isDuplicateViolation(cause);
+        }
+        return false;
     }
 }
