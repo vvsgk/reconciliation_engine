@@ -70,9 +70,20 @@ public class EventService {
 
         ReconciliationResult result = resolver.resolve(eventRepository.findByAccountIdOrderByTimestampAscEventIdAsc(request.accountId()));
 
-        if (account == null) account = new Account(request.accountId(), result.finalBalance(), request.currency(), now);
-        else account.update(result.finalBalance(), now);
-        accountRepository.saveAndFlush(account);
+        if (account == null) {
+            try {
+                account = new Account(request.accountId(), result.finalBalance(), request.currency(), now);
+                accountRepository.saveAndFlush(account);
+            } catch (org.springframework.dao.DataIntegrityViolationException ex) {
+                // Another thread created the account concurrently; re-load and update
+                account = accountRepository.findById(request.accountId()).orElseThrow();
+                account.update(result.finalBalance(), now);
+                accountRepository.saveAndFlush(account);
+            }
+        } else {
+            account.update(result.finalBalance(), now);
+            accountRepository.saveAndFlush(account);
+        }
 
         // Save audit with richer fields and explanatory reason
         String reason = explainDecision(result, eventRepository.findByAccountIdOrderByTimestampAscEventIdAsc(request.accountId()));
