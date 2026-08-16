@@ -1,0 +1,6 @@
+[
+  {"eventId":"TS-001","timestamp":"2026-08-15T08:00:00Z","accountId":"ACC-TIME","amount":900.00,"currency":"USD","source":"bank"},
+  {"eventId":"TS-002","timestamp":"2026-08-15T10:00:01Z","accountId":"ACC-TIME","amount":100.00,"currency":"USD","source":"ledger"},
+  {"eventId":"AAA-TIE","timestamp":"2026-08-15T10:00:01Z","accountId":"ACC-TIE","amount":50.00,"currency":"USD","source":"bank"},
+  {"eventId":"ZZZ-TIE","timestamp":"2026-08-15T10:00:01Z","accountId":"ACC-TIE","amount":50.00,"currency":"USD","source":"ledger"}
+]

@@ -1,0 +1,5 @@
+[
+  {"eventId":"RP-003","timestamp":"2026-08-15T12:00:00Z","accountId":"ACC-REPLAY","amount":80.00,"currency":"INR","source":"gateway"},
+  {"eventId":"RP-001","timestamp":"2026-08-15T09:00:00Z","accountId":"ACC-REPLAY","amount":100.00,"currency":"INR","source":"bank"},
+  {"eventId":"RP-002","timestamp":"2026-08-15T09:30:00Z","accountId":"ACC-REPLAY","amount":150.00,"currency":"INR","source":"ledger"}
+]
