@@ -43,11 +43,11 @@ class ReconciliationEngineApplicationTests extends PostgresTestBase {
         mockMvc = MockMvcBuilders.standaloneSetup(eventController)
                 .setControllerAdvice(new GlobalExceptionHandler())
                 .build();
-        cleanDatabase();
-    }
 
-    @BeforeEach
-    void cleanDatabase() { auditRepository.deleteAll(); accountRepository.deleteAll(); eventRepository.deleteAll(); }
+        auditRepository.deleteAll();
+        accountRepository.deleteAll();
+        eventRepository.deleteAll();
+    }
 
     @Test
     void contextLoads() { }

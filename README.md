@@ -1,252 +1,1385 @@
 # Reconciliation Engine
 
-[![Java](https://img.shields.io/badge/Java-17-%23007f00)](https://adoptium.net/)
-[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4.0-blue)](https://spring.io/projects/spring-boot)
-[![License](https://img.shields.io/badge/License-MIT-lightgrey)](./LICENSE)
+> A deterministic transaction-reconciliation service for processing out-of-order account-state events, resolving canonical account state, recording auditable decisions, and reproducing state through deterministic replay.
 
-A deterministic transaction-reconciliation service that accepts out-of-order account-state reports (events), decides the canonical account state per the product rule, stores a human-readable audit for each ingestion, and can replay history to reproduce state and a cryptographic fingerprint.
+<p align="center">
+
+**Java 17** · **Spring Boot 4** · **PostgreSQL 17** · **Spring Data JPA** · **JUnit 5** · **Testcontainers**
+
+</p>
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Important: Database Credentials](#important-database-credentials)
+- [Core Features](#core-features)
+- [Technology Stack](#technology-stack)
+- [Architecture](#architecture)
+- [Reconciliation Policy](#reconciliation-policy)
+- [Data Model](#data-model)
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+  - [1. Start Docker](#1-start-docker)
+  - [2. Verify Java and Docker](#2-verify-java-and-docker)
+  - [3. Make Maven Wrapper Executable](#3-make-maven-wrapper-executable)
+  - [4. Run the Test Suite](#4-run-the-test-suite)
+  - [5. Start the Application](#5-start-the-application)
+- [Configuration](#configuration)
+- [API](#api)
+  - [POST /events](#post-events)
+  - [POST /replay](#post-replay)
+- [Idempotency and Currency Rules](#idempotency-and-currency-rules)
+- [Auditability](#auditability)
+- [Replay and Deterministic Fingerprinting](#replay-and-deterministic-fingerprinting)
+- [Testing](#testing)
+- [Testcontainers and PostgreSQL](#testcontainers-and-postgresql)
+- [Troubleshooting](#troubleshooting)
+- [Fixtures](#fixtures)
+- [Stress Testing](#stress-testing)
+- [Useful Maven Commands](#useful-maven-commands)
+- [Security Checklist](#security-checklist)
+- [Project Structure](#project-structure)
+- [Development Workflow](#development-workflow)
+- [License](#license)
+
+---
+
+## Overview
+
+The Reconciliation Engine accepts account-state events that may arrive out of order and determines the canonical state of each account according to a deterministic reconciliation policy.
+
+The system is designed around four guarantees:
+
+1. **Deterministic reconciliation**  
+   The same event history produces the same final state regardless of arrival order.
+
+2. **Transactional integrity**  
+   Event persistence, account updates, and audit records are handled atomically.
+
+3. **Idempotency**  
+   Repeated delivery of the same event does not create duplicate state.
+
+4. **Replayability**  
+   Historical events can be replayed without modifying live state, producing a reproducible cryptographic fingerprint.
+
+> **Balance semantics:** The account balance represents the amount of the currently resolved event. It is **not** the sum of all transaction amounts.
+
+---
+
+# Important: Database Credentials
 
 > **Important:** The current development configuration references PostgreSQL credentials stored in a local/internal environment. **Before running or deploying this project, replace the database URL, username, and password with your own PostgreSQL credentials. Do not use the development credentials.** For deployment, use environment variables or a secrets manager and never commit real credentials to Git.
 
-Table of contents
-- Quickstart
-- Architecture & Policy (authoritative)
-- Data model
-- API examples
-- Tests & Postgres (Testcontainers)
-- Stress harness
-- Audit & Replay
-- Security: credentials checklist
-- Fixtures & troubleshooting
-- Contributing
+### Never commit credentials
 
-Quickstart (docker + env)
-1. Ensure Docker is running locally.
-2. Export database credentials (do NOT commit credentials into git):
+Do not commit:
+
+- PostgreSQL passwords
+- Production credentials
+- API keys
+- Internal connection strings
+- Secrets from local development environments
+
+For local development, use environment variables:
 
 ```bash
 export SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/reconciliation_test
 export SPRING_DATASOURCE_USERNAME=reconciliation_user
-export SPRING_DATASOURCE_PASSWORD=REPLACE_WITH_STRONG_PASSWORD
+export SPRING_DATASOURCE_PASSWORD='YOUR_STRONG_PASSWORD'
 ```
 
-3. Run the app:
+For CI/CD and production, use your platform's secret-management system.
 
-```bash
-./mvnw -DskipTests spring-boot:run
+If an internal credential has already been exposed, treat it as compromised and rotate it.
+
+---
+
+# Core Features
+
+### Deterministic reconciliation
+
+Events are processed chronologically using a strict pairwise conflict-resolution policy.
+
+### Out-of-order event handling
+
+Events can arrive in any order while still producing the same canonical account state.
+
+### Idempotent ingestion
+
+`eventId` acts as the unique idempotency key.
+
+### Currency validation
+
+The first event establishes an account's currency. A later event using a different currency is rejected and the transaction is rolled back.
+
+### Transactional rollback
+
+A failed ingestion does not leave partial changes across:
+
+- event storage
+- account state
+- audit records
+
+### Audit trail
+
+Every successful ingestion produces an auditable explanation of how the winning event was selected.
+
+### Deterministic replay
+
+Stored history can be replayed to reconstruct account state without changing live data.
+
+### Cryptographic fingerprint
+
+Replay generates a SHA-256 fingerprint from the canonical reconciliation result.
+
+### Concurrency handling
+
+The test suite exercises duplicate storms and concurrent ingestion for the same account.
+
+---
+
+# Technology Stack
+
+| Layer | Technology |
+|---|---|
+| Language | Java 17 |
+| Framework | Spring Boot 4 |
+| API | Spring Web MVC |
+| Persistence | Spring Data JPA |
+| ORM | Hibernate |
+| Database | PostgreSQL 17 |
+| Testing | JUnit 5 |
+| Integration Testing | Testcontainers |
+| Build Tool | Maven Wrapper |
+| Container Runtime | Docker / Docker Desktop |
+| Fingerprinting | SHA-256 |
+
+---
+
+# Architecture
+
+At a high level, event ingestion follows this flow:
+
+```text
+                    POST /events
+                         │
+                         ▼
+                Request Validation
+                         │
+                         ▼
+                 Idempotency Check
+                         │
+                         ▼
+                  Currency Check
+                         │
+                         ▼
+                  Persist Event
+                         │
+                         ▼
+             Deterministic Resolver
+                         │
+                         ▼
+                 Account Update
+                         │
+                         ▼
+                  Audit Record
+                         │
+                         ▼
+                     Response
 ```
 
-4. Run tests (recommended with Testcontainers Postgres):
+Replay follows a separate read-only path:
 
-```bash
-./mvnw -DskipTests=false test
+```text
+                    POST /replay
+                         │
+                         ▼
+                  Load Event History
+                         │
+                         ▼
+                Apply Optional "until"
+                         │
+                         ▼
+                 Canonical Ordering
+                         │
+                         ▼
+             Deterministic Resolution
+                         │
+                         ▼
+              Generate SHA-256 Hash
+                         │
+                         ▼
+                     Response
 ```
 
-Architecture & policy (authoritative)
-The service implements a deterministic pairwise folding policy (the PRD):
-- For a candidate event and the next chronological event:
-    - If timestamp difference ≤ 1 hour → the event with the higher amount wins. Tie-breakers: earlier timestamp, then lexicographically smaller eventId.
-    - If timestamp difference > 1 hour → the later timestamp wins. Tie-breakers: higher amount, then lexicographically smaller eventId.
+---
 
-This policy is applied in chronological order to produce a single resolved event for an account at any point in time. Replay uses the same algorithm and produces a canonical fingerprint (SHA-256) over policy version + canonical ordered events + result.
+# Reconciliation Policy
 
-Data model (summary)
-- events (event_id PK): account_id, timestamp, amount, currency, source, created_at.
-- accounts (account_id PK): balance (resolved event amount), currency, updated_at, version (optimistic lock).
-- audit_records (reconciliation_id PK): timestamp, account_id, conflicting_events (LOB JSON), resolved_event, resolution_method, final_balance, policy_version, previous_resolved_event, decision_reason, replay_run_id.
+This is the authoritative conflict-resolution policy.
 
-Important semantics
-- Balance is the resolved event's amount (not a sum of transactions).
-- The account's first event sets currency. Any later event with a different currency is rejected with 400 and the entire ingestion (event insert + account change + audit) must be rolled back.
-- Event idempotency: event_id is unique—duplicate insertion returns 409.
+Events are processed in chronological order.
 
-API examples
-1) Ingest an event
+For each candidate event and the next chronological event:
+
+## Timestamp difference ≤ 1 hour
+
+The event with the **higher amount** wins.
+
+Tie-breakers:
+
+1. Earlier timestamp wins.
+2. If timestamps are equal, lexicographically smaller `eventId` wins.
+
+## Timestamp difference > 1 hour
+
+The event with the **later timestamp** wins.
+
+Tie-breakers:
+
+1. Higher amount wins.
+2. If amounts are equal, lexicographically smaller `eventId` wins.
+
+### Policy summary
+
+```text
+Difference <= 1 hour
+    ├── Higher amount wins
+    ├── Earlier timestamp wins on amount tie
+    └── Smaller eventId wins on timestamp tie
+
+Difference > 1 hour
+    ├── Later timestamp wins
+    ├── Higher amount wins on timestamp tie
+    └── Smaller eventId wins on amount tie
+```
+
+The policy is deterministic by design.
+
+Therefore:
+
+```text
+A → B → C
+```
+
+and:
+
+```text
+C → A → B
+```
+
+must produce the same canonical result when they contain the same event history.
+
+---
+
+# Data Model
+
+## `events`
+
+Stores every accepted event.
+
+```text
+event_id
+account_id
+timestamp
+amount
+currency
+source
+created_at
+```
+
+`event_id` is the primary key and idempotency key.
+
+---
+
+## `accounts`
+
+Stores the current canonical account state.
+
+```text
+account_id
+balance
+currency
+updated_at
+version
+```
+
+The `balance` is the amount from the resolved event, not a running sum.
+
+---
+
+## `audit_records`
+
+Stores the reconciliation decision for each successful ingestion.
+
+Important information includes:
+
+```text
+reconciliation_id
+timestamp
+account_id
+conflicting_events
+resolved_event
+resolution_method
+final_balance
+policy_version
+previous_resolved_event
+decision_reason
+replay_run_id
+```
+
+---
+
+# Prerequisites
+
+Install the following before running the project:
+
+- **Java 17**
+- **Docker Desktop**
+- **Git**
+
+Verify Java:
 
 ```bash
-curl -s -X POST http://localhost:8080/events \
+java -version
+```
+
+Verify Docker:
+
+```bash
+docker info
+```
+
+Verify the Docker CLI can communicate with the server:
+
+```bash
+docker ps
+```
+
+An empty `docker ps` result is perfectly valid.
+
+---
+
+# Quick Start
+
+This is the recommended local development path.
+
+```text
+Start Docker
+     ↓
+Verify Java + Docker
+     ↓
+chmod +x mvnw
+     ↓
+./mvnw clean test
+     ↓
+BUILD SUCCESS
+     ↓
+Configure PostgreSQL credentials
+     ↓
+./mvnw spring-boot:run
+     ↓
+Use /events and /replay
+```
+
+---
+
+## 1. Start Docker
+
+### macOS
+
+```bash
+open -a Docker
+```
+
+Wait until Docker Desktop finishes starting.
+
+Then:
+
+```bash
+docker info
+```
+
+and:
+
+```bash
+docker ps
+```
+
+### Important
+
+Do **not** execute the Docker socket directly.
+
+For example, this is not a valid command:
+
+```text
+/Users/<username>/.docker/run/docker.sock
+```
+
+The Docker CLI communicates with the socket automatically.
+
+---
+
+## 2. Verify Java and Docker
+
+Check Java:
+
+```bash
+java -version
+```
+
+Check Docker:
+
+```bash
+docker info
+```
+
+Check running containers:
+
+```bash
+docker ps
+```
+
+On Docker Desktop for macOS, if the Docker Desktop context is available:
+
+```bash
+docker context ls
+```
+
+If necessary:
+
+```bash
+docker context use desktop-linux
+```
+
+Then:
+
+```bash
+docker info
+```
+
+You should see a `Server` section.
+
+---
+
+## 3. Make Maven Wrapper Executable
+
+From the project root:
+
+```bash
+chmod +x mvnw
+```
+
+Verify Maven:
+
+```bash
+./mvnw -version
+```
+
+You do not need a separate Maven installation when using the Maven Wrapper.
+
+---
+
+## 4. Run the Test Suite
+
+The recommended command is:
+
+```bash
+./mvnw clean test
+```
+
+This performs:
+
+```text
+Clean target/
+     ↓
+Compile application
+     ↓
+Compile tests
+     ↓
+Start PostgreSQL through Testcontainers
+     ↓
+Start Spring Boot test context
+     ↓
+Run JUnit tests
+     ↓
+Stop test containers
+```
+
+### First run
+
+The first run can take longer because Testcontainers may download its required Docker images, including PostgreSQL.
+
+For example:
+
+```text
+testcontainers/ryuk
+postgres:17-alpine
+```
+
+This is expected.
+
+Once the images are cached, later test runs are generally faster.
+
+### Successful build
+
+Look for:
+
+```text
+BUILD SUCCESS
+```
+
+and:
+
+```text
+Failures: 0
+Errors: 0
+```
+
+---
+
+## 5. Start the Application
+
+The application itself needs a PostgreSQL database.
+
+Testcontainers is used for automated tests. For manually running the application, use a local PostgreSQL instance or PostgreSQL through Docker.
+
+Configure:
+
+```bash
+export SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/reconciliation_test
+export SPRING_DATASOURCE_USERNAME=reconciliation_user
+export SPRING_DATASOURCE_PASSWORD='YOUR_STRONG_PASSWORD'
+```
+
+Then:
+
+```bash
+./mvnw spring-boot:run
+```
+
+The application should be available at:
+
+```text
+http://localhost:8080
+```
+
+---
+
+# Configuration
+
+The application can receive database configuration through environment variables:
+
+```text
+SPRING_DATASOURCE_URL
+SPRING_DATASOURCE_USERNAME
+SPRING_DATASOURCE_PASSWORD
+```
+
+Example:
+
+```bash
+export SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/reconciliation_test
+export SPRING_DATASOURCE_USERNAME=reconciliation_user
+export SPRING_DATASOURCE_PASSWORD='YOUR_STRONG_PASSWORD'
+```
+
+### PostgreSQL with Docker
+
+If you do not have a local PostgreSQL installation, you can run PostgreSQL with Docker:
+
+```bash
+docker run --name reconciliation-postgres \
+  -e POSTGRES_DB=reconciliation_test \
+  -e POSTGRES_USER=reconciliation_user \
+  -e POSTGRES_PASSWORD='YOUR_STRONG_PASSWORD' \
+  -p 5432:5432 \
+  -d postgres:17-alpine
+```
+
+Check:
+
+```bash
+docker ps
+```
+
+Then start the application:
+
+```bash
+./mvnw spring-boot:run
+```
+
+Stop the database:
+
+```bash
+docker stop reconciliation-postgres
+```
+
+Remove it:
+
+```bash
+docker rm reconciliation-postgres
+```
+
+---
+
+# API
+
+The service exposes two primary endpoints.
+
+---
+
+## POST `/events`
+
+Ingest an account-state event.
+
+### Request
+
+```bash
+curl -X POST http://localhost:8080/events \
   -H 'Content-Type: application/json' \
-  -d '{"eventId":"E001","timestamp":"2026-08-15T09:00:00Z","accountId":"ACC001","amount":150.00,"currency":"USD","source":"bank"}'
+  -d '{
+    "eventId": "E001",
+    "timestamp": "2026-08-15T09:00:00Z",
+    "accountId": "ACC001",
+    "amount": 150.00,
+    "currency": "USD",
+    "source": "bank"
+  }'
 ```
 
-Success returns 200 and the reconciliation payload:
-- resolvedEvent, resolutionMethod, consideredEventIds, finalBalance
+### Successful response
 
-2) Replay
+The response contains the reconciliation result, including:
+
+- resolved event
+- resolution method
+- considered event IDs
+- final balance
+
+---
+
+## POST `/replay`
+
+Replay the stored event history for an account.
 
 ```bash
-curl -s -X POST http://localhost:8080/replay \
+curl -X POST http://localhost:8080/replay \
   -H 'Content-Type: application/json' \
-  -d '{"accountId":"ACC001","until":"2026-08-15T12:00:00Z"}'
+  -d '{
+    "accountId": "ACC001",
+    "until": "2026-08-15T12:00:00Z"
+  }'
 ```
 
-Tests & Postgres (Testcontainers recommended)
-- Tests exercise concurrency, idempotency, rollback, and deterministic replay. H2 is present only for lightweight experiments but is not a valid substitute for Postgres when testing concurrency/locking/SQL state codes.
-- Recommended: run tests with Docker available so Testcontainers can spin up Postgres.
-- To switch to a local Postgres for tests, set SPRING_DATASOURCE_URL, USERNAME, PASSWORD before running `./mvnw test`.
+Replay is read-only.
 
-Stress harness
-- A stress harness scaffold is included under `src/test/java/.../stress`.
-- The harness supports workloads: normal, duplicate storm, out-of-order, hot-spot hot-account.
-- Large runs (100k–1M events) require a dedicated machine/CI runner and a real Postgres instance. Run small smoke stress locally (10k) before attempting larger runs.
+It reconstructs the account state using the same deterministic reconciliation policy.
 
-Audit & Replay
-- Each successful ingestion creates an audit explaining why a particular event won. `decision_reason` includes the policy name, the compared amounts/timestamps, and tie-break rationale.
-- Audits store `previousResolvedEvent` for transitions; this provides a state-change trail.
-- Replay generates a canonical representation and stores SHA-256(policyVersion + canonicalEvents + decision) so live processing == replay fingerprint.
+---
 
-Security: credentials checklist (must do before testing)
-- Remove any hard-coded credentials from files. If you find an internal/system password in the repo, treat it as compromised and rotate it before use.
-- Use environment variables or a secrets manager in CI. Example env vars shown in Quickstart.
-- For Postgres in Docker Compose, prefer a generated strong password; do NOT reuse internal passwords.
+# Idempotency and Currency Rules
 
-Docker compose (example)
+## Event Idempotency
 
-```yaml
-version: '3.8'
-services:
-  db:
-    image: postgres:15
-    environment:
-      POSTGRES_DB: reconciliation_test
-      POSTGRES_USER: reconciliation_user
-      POSTGRES_PASSWORD: change_me_strong_password
-    ports:
-      - '5432:5432'
-  app:
-    build: .
-    environment:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/reconciliation_test
-      SPRING_DATASOURCE_USERNAME: reconciliation_user
-      SPRING_DATASOURCE_PASSWORD: change_me_strong_password
-    depends_on:
-      - db
+`eventId` is unique.
+
+Example:
+
+```text
+POST E001
+    ↓
+Accepted
+
+POST E001
+    ↓
+Duplicate
+    ↓
+409 Conflict
 ```
 
-Fixtures & examples
-- Fixtures live in `fixtures/` and include duplicate, out-of-order, within-hour-conflict, >1-hour conflict, timestamp-tie scenarios. Use them as a source of truth for expected behavior.
+Repeated delivery of the same event must not create duplicate records.
 
-Troubleshooting
-- If concurrency tests fail: ensure Postgres is used, not H2. Increase JVM threads or run stress on a machine with more CPU.
-- If you see DataIntegrityViolationException: check whether it is a duplicate-key (translate to 409) vs an unexpected constraint; handle accordingly and inspect DB logs.
+---
 
-Contributing
-- Create issues for failing tests, determinism questions, or performance investigations.
-- For major changes (policy or data model), include a compatibility test proving old vs new behavior and update the replay fingerprint policy version.
+## Currency
 
-License
-- (Add license file) — example: MIT
+The first event establishes the account currency.
 
---
-Notes: do NOT commit real passwords. Replace any internal passwords found in the repo and rotate credentials before testing or CI runs.
+Example:
 
-A deterministic transaction-reconciliation service that accepts events in any arrival order, resolves account state according to a strict policy, stores an auditable decision for every accepted ingestion, and can replay history to reconstruct account state deterministically.
+```text
+ACC001
+First event → USD
+```
 
-## High-level architecture
+A later event with another currency is rejected:
 
-POST /events -> validate (schema + currency) -> idempotency check -> persist event -> ordered resolver (PRD policy) -> account upsert + audit -> response
+```text
+ACC001
+First event  → USD
+Later event  → EUR
+                 ↓
+             Rejected
+```
 
-POST /replay -> load events (optional `until`) -> ordered resolver (read-only) -> response + replay fingerprint
+The request returns:
 
-Core technologies: Java 17, Spring Boot 4, Spring Web MVC, Spring Data JPA, PostgreSQL (recommended for tests), JUnit 5, Maven, Docker.
+```text
+400 Bad Request
+```
 
-## Conflict policy (authoritative PRD rule)
+The complete ingestion must roll back.
 
-Events are processed in chronological order and folded pairwise. For each comparison between the current candidate and the next event:
+That means these operations must not partially commit:
 
-- If timestamp difference ≤ 1 hour → higher amount wins. Tie-breakers: earlier timestamp, then lexicographically smaller eventId.
-- If timestamp difference > 1 hour → latest timestamp wins. Tie-breakers: higher amount, then lexicographically smaller eventId.
+```text
+Event insert
+Account update
+Audit insert
+```
 
-This rule is implemented deterministically so different arrival orders produce the same final state and replay fingerprint.
+---
 
-## Data model
+# Auditability
 
-- events: every accepted event (event_id PK, account_id, timestamp, amount, currency, source, created_at). event_id is the idempotency key.
-- accounts: stores current resolved balance, currency, updated_at; optimistic locking (version) used. Balance semantics: the resolved event's amount is the account balance (not a running sum).
-- audit_records: one audit per accepted ingestion capturing considered event IDs, resolved event, resolution method, final balance, policy version, previousResolvedEvent, decisionReason, and replayRunId.
+Every successful ingestion creates an audit record.
 
-## Determinism & Replay
+The audit explains:
 
-Replay constructs a canonical ordered event list (by timestamp then eventId), applies the same pairwise policy, and computes a canonical fingerprint:
+- which events were considered
+- which event won
+- which policy was applied
+- what the previous resolved event was
+- what the final balance became
+- why the winner was selected
 
-canonical = policyVersion + canonicalOrderedEvents + resolvedEventId + resolutionMethod + finalBalance
-SHA-256(canonical) is stored as the replay fingerprint. Replay is read-only and should produce the same fingerprint as live processing.
+This allows the reconciliation decision to be inspected after the fact rather than treating the resolver as an opaque black box.
 
-## API
+---
 
+# Replay and Deterministic Fingerprinting
+
+Replay reconstructs state from historical events.
+
+The process is:
+
+```text
+Load events
+    ↓
+Filter account
+    ↓
+Apply optional "until" boundary
+    ↓
+Sort canonically
+    ↓
+Apply reconciliation policy
+    ↓
+Resolve final state
+    ↓
+Build canonical representation
+    ↓
+SHA-256
+    ↓
+Replay fingerprint
+```
+
+The canonical representation contains:
+
+```text
+policyVersion
+canonical ordered events
+resolved event
+resolution method
+final balance
+```
+
+Conceptually:
+
+```text
+canonical representation
+        ↓
+      SHA-256
+        ↓
+replay fingerprint
+```
+
+The same event history, policy version, and ordering rules should produce the same fingerprint.
+
+Replay does not modify live account state.
+
+---
+
+# Testing
+
+The project is designed to test against PostgreSQL rather than treating H2 as an equivalent replacement.
+
+The suite covers:
+
+- application context startup
+- reconciliation behavior
+- conflict resolution
+- duplicate event handling
+- currency mismatch
+- transactional rollback
+- out-of-order events
+- timestamp ties
+- within-hour conflicts
+- deterministic replay
+- replay boundaries
+- concurrent duplicate ingestion
+- concurrent same-account ingestion
+
+Run everything:
+
+```bash
+./mvnw clean test
+```
+
+---
+
+## Run a Focused Startup Test
+
+Before running the entire suite, you can verify Docker, Testcontainers, PostgreSQL, Spring Boot, and JPA with:
+
+```bash
+./mvnw -Dtest=ReconciliationEngineApplicationTests#contextLoads test
+```
+
+A successful result should end with:
+
+```text
+Tests run: 1, Failures: 0, Errors: 0
+BUILD SUCCESS
+```
+
+Then run:
+
+```bash
+./mvnw clean test
+```
+
+---
+
+# Testcontainers and PostgreSQL
+
+Integration tests use Testcontainers to start PostgreSQL automatically.
+
+The architecture is:
+
+```text
+JUnit 5
+   │
+   ▼
+Testcontainers
+   │
+   ▼
+PostgreSQL 17
+   │
+   ▼
+Spring Boot
+   │
+   ▼
+JPA / Hibernate
+   │
+   ▼
+Integration Tests
+```
+
+This is intentional.
+
+PostgreSQL is required for meaningful verification of database behavior involving:
+
+- transactions
+- unique constraints
+- locking
+- concurrency
+- SQL state handling
+- database-specific behavior
+
+Therefore:
+
+> **A test passing against H2 is not sufficient evidence that PostgreSQL behavior is correct.**
+
+---
+
+# Troubleshooting
+
+## `./mvnw: permission denied`
+
+Run:
+
+```bash
+chmod +x mvnw
+```
+
+Then:
+
+```bash
+./mvnw clean test
+```
+
+---
+
+## Docker is not running
+
+Run:
+
+```bash
+open -a Docker
+```
+
+Wait for Docker Desktop to start.
+
+Then:
+
+```bash
+docker info
+docker ps
+```
+
+---
+
+## `Could not find a valid Docker environment`
+
+Check:
+
+```bash
+docker info
+```
+
+Then:
+
+```bash
+docker context ls
+```
+
+If using Docker Desktop:
+
+```bash
+docker context use desktop-linux
+```
+
+Then:
+
+```bash
+docker ps
+```
+
+---
+
+## `NoClassDefFoundError: Could not initialize class`
+
+Do not immediately modify every failing test.
+
+When many tests fail with the same `NoClassDefFoundError`, inspect the first underlying exception.
+
+Run:
+
+```bash
+./mvnw -e -Dtest=ReconciliationEngineApplicationTests#contextLoads test
+```
+
+Look for the first:
+
+```text
+Caused by:
+```
+
+A shared test-infrastructure failure can cause many tests to fail at once.
+
+---
+
+## The first test run is slow
+
+This is usually normal.
+
+Testcontainers may need to download:
+
+```text
+testcontainers/ryuk
+postgres:17-alpine
+```
+
+The PostgreSQL image is downloaded only when it is not already available locally.
+
+Subsequent runs should normally be faster.
+
+---
+
+## Hikari reports closed connections
+
+You may see warnings similar to:
+
+```text
+Failed to validate connection
+This connection has been closed
+```
+
+If the suite still finishes with:
+
+```text
+Failures: 0
+Errors: 0
+BUILD SUCCESS
+```
+
+the warning did not cause a test failure.
+
+If the suite hangs or fails around concurrency tests, investigate PostgreSQL container lifecycle and Spring/Hikari context reuse before changing reconciliation logic.
+
+---
+
+# Fixtures
+
+Test fixtures are stored under:
+
+```text
+fixtures/
+```
+
+They cover scenarios including:
+
+- duplicate events
+- out-of-order events
+- within-hour conflicts
+- conflicts greater than one hour
+- timestamp ties
+- combined scenarios
+
+Fixtures should be treated as behavioral examples of the reconciliation policy.
+
+---
+
+# Stress Testing
+
+A stress-testing harness is included under the test sources.
+
+Supported workload categories include:
+
+```text
+normal
+duplicate storm
+out-of-order events
+hot-account / hot-spot contention
+```
+
+Large workloads such as:
+
+```text
+100k
+500k
+1M events
+```
+
+should be executed on a machine or CI runner with sufficient CPU, memory, and a properly provisioned PostgreSQL instance.
+
+For performance analysis, record at least:
+
+```text
+Throughput
+p50 latency
+p95 latency
+p99 latency
+Error rate
+409 duplicate rate
+```
+
+Do not treat a small laptop smoke test as a production benchmark.
+
+---
+
+# Useful Maven Commands
+
+### Full clean test
+
+```bash
+./mvnw clean test
+```
+
+### Run tests without cleaning
+
+```bash
+./mvnw test
+```
+
+### Run one test class
+
+```bash
+./mvnw -Dtest=ReconciliationEngineApplicationTests test
+```
+
+### Run one test method
+
+```bash
+./mvnw -Dtest=ReconciliationEngineApplicationTests#contextLoads test
+```
+
+### Compile/package without running tests
+
+```bash
+./mvnw clean package -DskipTests
+```
+
+### Start the application
+
+```bash
+./mvnw spring-boot:run
+```
+
+### Check Maven version
+
+```bash
+./mvnw -version
+```
+
+---
+
+# Security Checklist
+
+Before committing or deploying:
+
+- [ ] No real database passwords are committed.
+- [ ] No production credentials are committed.
+- [ ] No API keys or secrets are committed.
+- [ ] Development/internal credentials have been replaced.
+- [ ] Any exposed credentials have been rotated.
+- [ ] Local configuration uses environment variables where appropriate.
+- [ ] CI/CD uses a secrets manager.
+- [ ] Production credentials are never copied into README examples.
+
+---
+
+# Project Structure
+
+```text
+reconciliation-engine/
+│
+├── src/
+│   ├── main/
+│   │   ├── java/
+│   │   └── resources/
+│   │
+│   └── test/
+│       ├── java/
+│       └── resources/
+│
+├── fixtures/
+│
+├── pom.xml
+├── mvnw
+├── mvnw.cmd
+├── README.md
+└── LICENSE
+```
+
+---
+
+# Development Workflow
+
+Use this workflow when making changes.
+
+### 1. Start Docker
+
+```bash
+docker info
+```
+
+### 2. Run the focused startup test
+
+```bash
+./mvnw -Dtest=ReconciliationEngineApplicationTests#contextLoads test
+```
+
+### 3. Run the complete suite
+
+```bash
+./mvnw clean test
+```
+
+### 4. Inspect failures
+
+Classify the failure before changing code:
+
+```text
+Compilation
+    ↓
+Test infrastructure
+    ↓
+Database
+    ↓
+Application startup
+    ↓
+Application behavior
+    ↓
+Assertion
+    ↓
+Concurrency
+```
+
+Do not modify reconciliation logic to solve a Docker or Testcontainers problem.
+
+### 5. Start the application
+
+After the tests pass:
+
+```bash
+./mvnw spring-boot:run
+```
+
+### 6. Exercise the API
+
+Use:
+
+```text
 POST /events
-- Body: {eventId, timestamp (ISO8601 UTC), accountId, amount (decimal), currency (ISO code), source}
-- Responses: 200 OK (event accepted), 400 Bad Request (validation or currency mismatch), 409 Conflict (duplicate event id)
-
 POST /replay
-- Body: {accountId, until?}
-- Returns: reconciliation result at `until` (inclusive) and replay fingerprint.
+```
 
-## Tests, local dev & CI (recommended)
+---
 
-This project is designed to run its test suite against PostgreSQL. For reproducible local/CI runs use Testcontainers. Steps:
+# Determinism Guarantee
 
-1. Install Docker and ensure it runs locally.
-2. Run tests with Testcontainers-managed Postgres (recommended):
-   ./mvnw -DskipTests=false test
+The central design goal is:
 
-There is a lightweight H2 config present for quick experiments, but H2 is not equivalent to PostgreSQL for concurrency, locks, or SQL error codes; do not rely on H2 for final verification.
+```text
+Same events
+      +
+Same policy version
+      +
+Same canonical ordering
+      =
+Same resolved state
+      +
+Same replay fingerprint
+```
 
-## Configuration & secrets (IMPORTANT)
+For example:
 
-- Never commit real credentials. This repository may contain example/test credentials or previously used internal passwords. Do NOT use them in any non-isolated environment.
-- Before running tests or starting the service, set database credentials securely via environment variables or an external config file. Examples:
+```text
+Arrival order:
+A → B → C
+```
 
-  export SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/reconciliation_test
-  export SPRING_DATASOURCE_USERNAME=reconciliation_user
-  export SPRING_DATASOURCE_PASSWORD=REPLACE_WITH_STRONG_PASSWORD
+and:
 
-- If you see a credential in source (e.g., application-test.properties), replace it immediately with secure values or remove it and rely on Testcontainers or env vars. Treat any "internal" password as compromised and rotate it before testing.
+```text
+Arrival order:
+C → A → B
+```
 
-## How to run locally (recommended quickstart)
+must produce the same final canonical state when the underlying event history is identical.
 
-1. Ensure Docker is running.
-2. Run the test Postgres via Testcontainers automatically by running:
-   ./mvnw test
+This behavior is covered by the replay and concurrency tests.
 
-3. Run the application (dev):
-   ./mvnw spring-boot:run
-   or with environment overrides:
-   SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/reconciliation \
-   SPRING_DATASOURCE_USERNAME=... \
-   SPRING_DATASOURCE_PASSWORD=... \
-   ./mvnw spring-boot:run
+---
 
-4. API examples (curl):
-   curl -X POST -H "Content-Type: application/json" -d @event.json http://localhost:8080/events
-   curl -X POST -H "Content-Type: application/json" -d '{"accountId":"ACC-REPLAY","until":"2026-08-15T09:30:00Z"}' http://localhost:8080/replay
+# Development Principles
 
-## Stress testing harness
+Changes to the reconciliation policy are behavioral changes.
 
-A stress harness (disabled by default) is included under src/test/java/.../stress. It can generate workloads (10k/100k/500k/1M events) and measure throughput and latency percentiles. Run large stress tests on a machine with sufficient CPU/RAM and a real Postgres instance (not H2 nor ephemeral testcontainers unless you provision resources accordingly).
+When changing the policy:
 
-## Concurrency & idempotency
+1. Update the policy implementation.
+2. Update the relevant tests.
+3. Update fixtures.
+4. Update the policy version.
+5. Verify replay behavior.
+6. Verify fingerprint behavior.
+7. Document compatibility implications.
 
-- Event idempotency: event_id is unique. Duplicate event IDs return 409.
-- Account upsert: implemented with upsert/update pattern to reduce contention; account currency is validated inside the same transaction as event persistence and audit to ensure atomic rollback on failure.
+Do not silently change reconciliation rules.
 
-## Audit explanations
+---
 
-Audits contain a human-readable `decisionReason` explaining why a winner was chosen (policy name, amounts/timestamps compared, and tie-break rationale). `previousResolvedEvent` captures the prior winner when a new event changes the resolved state.
+# License
 
-## Fixtures
+See [`LICENSE`](./LICENSE).
 
-Fixtures are in `/fixtures/` and include combined complex scenarios (duplicates, out-of-order, within-hour conflicts, >1-hour conflicts, timestamp ties). Use them in tests or local runs.
+---
 
-## Security checklist before testing or submission
+## Quick Reference
 
-- Remove any hard-coded credentials from config files.
-- Rotate any internal/system passwords that were used during development.
-- Use env vars or a secrets manager for DB credentials in CI.
+### Test everything
 
-## Contributing & contact
+```bash
+./mvnw clean test
+```
 
-- Open issues for failing tests, performance bottlenecks, or determinism questions.
-- For large stress runs, prefer running on CI runners or dedicated benchmark machines and share measurements (p50/p95/p99, throughput, 409 rate).
+### Start Docker on macOS
 
-## License
+```bash
+open -a Docker
+```
+
+### Verify Docker
+
+```bash
+docker info
+docker ps
+```
+
+### Fix Maven permissions
+
+```bash
+chmod +x mvnw
+```
+
+### Verify Maven
+
+```bash
+./mvnw -version
+```
+
+### Run only the Spring/PostgreSQL startup test
+
+```bash
+./mvnw -Dtest=ReconciliationEngineApplicationTests#contextLoads test
+```
+
+### Start the application
+
+```bash
+./mvnw spring-boot:run
+```
+
+---
+
+## Expected Development Loop
+
+```text
+┌─────────────────────┐
+│    Docker Running   │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ ./mvnw clean test   │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│    BUILD SUCCESS    │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ Configure PostgreSQL│
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ ./mvnw spring-boot: │
+│       run           │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│     POST /events    │
+│     POST /replay    │
+└─────────────────────┘
+```
+
+The README is intended to be the single source of truth for local setup, testing, application startup, API usage, reconciliation behavior, and troubleshooting.

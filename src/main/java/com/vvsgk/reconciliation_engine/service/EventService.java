@@ -5,14 +5,12 @@ import tools.jackson.databind.ObjectMapper;
 
 import com.vvsgk.reconciliation_engine.dto.EventRequest;
 import com.vvsgk.reconciliation_engine.dto.EventResponse;
-import com.vvsgk.reconciliation_engine.entity.Account;
 import com.vvsgk.reconciliation_engine.entity.AuditRecord;
 import com.vvsgk.reconciliation_engine.entity.Event;
 import com.vvsgk.reconciliation_engine.exception.CurrencyMismatchException;
 import com.vvsgk.reconciliation_engine.exception.DuplicateEventException;
 import com.vvsgk.reconciliation_engine.reconciliation.ConflictResolver;
 import com.vvsgk.reconciliation_engine.reconciliation.ReconciliationResult;
-import com.vvsgk.reconciliation_engine.repository.AccountRepository;
 import com.vvsgk.reconciliation_engine.repository.AuditRecordRepository;
 import com.vvsgk.reconciliation_engine.repository.EventRepository;
 
@@ -20,9 +18,7 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
 
-import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -31,7 +27,6 @@ import org.springframework.transaction.annotation.Transactional;
 public class EventService {
 
     private final EventRepository eventRepository;
-    private final AccountRepository accountRepository;
     private final AuditRecordRepository auditRecordRepository;
     private final ObjectMapper objectMapper;
     private final JdbcTemplate jdbcTemplate;
@@ -40,107 +35,28 @@ public class EventService {
 
     public EventService(
             EventRepository eventRepository,
-            AccountRepository accountRepository,
             AuditRecordRepository auditRecordRepository,
             ObjectMapper objectMapper,
             JdbcTemplate jdbcTemplate) {
 
         this.eventRepository = eventRepository;
-        this.accountRepository = accountRepository;
         this.auditRecordRepository = auditRecordRepository;
         this.objectMapper = objectMapper;
         this.jdbcTemplate = jdbcTemplate;
     }
 
-    public EventResponse processEvent(EventRequest request) {
-
-        final int MAX_ATTEMPTS = 3;
-
-        int attempts = 0;
-
-        while (true) {
-
-            attempts++;
-
-            try {
-
-                return processEventTransactionally(request);
-
-            } catch (OptimisticLockingFailureException ex) {
-
-                if (attempts >= MAX_ATTEMPTS) {
-                    throw ex;
-                }
-            }
-        }
-    }
-
     @Transactional
-    protected EventResponse processEventTransactionally(EventRequest request) {
+    public EventResponse processEvent(EventRequest request) {
 
         Instant now = Instant.now();
 
         /*
-         * ------------------------------------------------------------
-         * 1. Validate account currency BEFORE inserting the event
-         * ------------------------------------------------------------
-         */
-
-        Account account =
-                accountRepository
-                        .findById(request.accountId())
-                        .orElse(null);
-
-        if (account != null
-                && !account.getCurrency().equals(request.currency())) {
-
-            throw new CurrencyMismatchException(request.accountId());
-        }
-
-        /*
-         * ------------------------------------------------------------
-         * 2. Build event
-         * ------------------------------------------------------------
-         */
-
-        Event event = new Event(
-                request.eventId(),
-                request.timestamp(),
-                request.accountId(),
-                request.amount(),
-                request.currency(),
-                request.source(),
-                now
-        );
-
-        /*
-         * ------------------------------------------------------------
-         * 3. EXPLICIT DATABASE INSERT
-         * ------------------------------------------------------------
-         *
-         * DO NOT use eventRepository.saveAndFlush(event) here.
-         *
-         * eventId is an application-assigned String @Id.
-         *
-         * Using JdbcTemplate forces a real SQL INSERT.
-         *
-         * Therefore:
-         *
-         * first event:
-         *     INSERT succeeds
-         *
-         * duplicate event:
-         *     PRIMARY KEY violation
-         *
-         * concurrent duplicate:
-         *     one INSERT succeeds
-         *     remaining INSERTs receive duplicate-key errors
-         *
-         * This makes the database the authoritative idempotency boundary.
+         * The database is the idempotency boundary.  The whole ingestion
+         * remains inside one transaction so an event insert, account update,
+         * and audit record either all commit or all roll back.
          */
 
         try {
-
             jdbcTemplate.update(
                     """
                     INSERT INTO events
@@ -157,146 +73,88 @@ public class EventService {
                     VALUES
                         (?, ?, ?, ?, ?, ?, ?, 0)
                     """,
-                    event.getEventId(),
-                    Timestamp.from(event.getTimestamp()),
-                    event.getAccountId(),
-                    event.getAmount(),
-                    event.getCurrency(),
-                    event.getSource(),
-                    Timestamp.from(event.getCreatedAt())
+                    request.eventId(),
+                    Timestamp.from(request.timestamp()),
+                    request.accountId(),
+                    request.amount(),
+                    request.currency(),
+                    request.source(),
+                    Timestamp.from(now)
             );
-
         } catch (DataIntegrityViolationException ex) {
-
             if (isDuplicateViolation(ex)) {
-
-                throw new DuplicateEventException(
-                        request.eventId()
-                );
+                throw new DuplicateEventException(request.eventId());
             }
-
             throw ex;
         }
 
         /*
-         * ------------------------------------------------------------
-         * 4. Reconciliation
-         * ------------------------------------------------------------
+         * Create the account row if this is the first event for the account.
+         * ON CONFLICT makes concurrent first-event requests safe.  We then
+         * lock the row and re-check currency so concurrent currency races
+         * cannot leave a mixed-currency account behind.
          */
+        jdbcTemplate.update(
+                """
+                INSERT INTO accounts
+                    (
+                        account_id,
+                        balance,
+                        currency,
+                        updated_at,
+                        version
+                    )
+                VALUES
+                    (?, ?, ?, ?, 0)
+                ON CONFLICT (account_id) DO NOTHING
+                """,
+                request.accountId(),
+                request.amount(),
+                request.currency(),
+                Timestamp.from(now)
+        );
 
-        List<Event> accountEvents =
-                eventRepository
-                        .findByAccountIdOrderByTimestampAscEventIdAsc(
-                                request.accountId()
-                        );
+        String accountCurrency = jdbcTemplate.queryForObject(
+                """
+                SELECT currency
+                FROM accounts
+                WHERE account_id = ?
+                FOR UPDATE
+                """,
+                String.class,
+                request.accountId()
+        );
 
-        ReconciliationResult result =
-                resolver.resolve(accountEvents);
-
-        /*
-         * ------------------------------------------------------------
-         * 5. Update account state
-         * ------------------------------------------------------------
-         */
-
-        if (account == null) {
-
-            try {
-
-                int updated =
-                        jdbcTemplate.update(
-                                """
-                                UPDATE accounts
-                                SET balance = ?,
-                                    currency = ?,
-                                    updated_at = ?,
-                                    version = version + 1
-                                WHERE account_id = ?
-                                """,
-                                result.finalBalance(),
-                                request.currency(),
-                                Timestamp.from(now),
-                                request.accountId()
-                        );
-
-                if (updated == 0) {
-
-                    try {
-
-                        jdbcTemplate.update(
-                                """
-                                INSERT INTO accounts
-                                    (
-                                        account_id,
-                                        balance,
-                                        currency,
-                                        updated_at,
-                                        version
-                                    )
-                                VALUES
-                                    (?, ?, ?, ?, 0)
-                                """,
-                                request.accountId(),
-                                result.finalBalance(),
-                                request.currency(),
-                                Timestamp.from(now)
-                        );
-
-                    } catch (DataIntegrityViolationException ex) {
-
-                        /*
-                         * Another request created this account between
-                         * our UPDATE and INSERT.
-                         */
-                        jdbcTemplate.update(
-                                """
-                                UPDATE accounts
-                                SET balance = ?,
-                                    currency = ?,
-                                    updated_at = ?,
-                                    version = version + 1
-                                WHERE account_id = ?
-                                """,
-                                result.finalBalance(),
-                                request.currency(),
-                                Timestamp.from(now),
-                                request.accountId()
-                        );
-                    }
-                }
-
-            } catch (DataAccessException ex) {
-
-                throw ex;
-            }
-
-        } else {
-
-            jdbcTemplate.update(
-                    """
-                    UPDATE accounts
-                    SET balance = ?,
-                        updated_at = ?,
-                        version = version + 1
-                    WHERE account_id = ?
-                    """,
-                    result.finalBalance(),
-                    Timestamp.from(now),
-                    request.accountId()
-            );
+        if (!accountCurrency.equals(request.currency())) {
+            throw new CurrencyMismatchException(request.accountId());
         }
 
         /*
-         * ------------------------------------------------------------
-         * 6. Audit
-         * ------------------------------------------------------------
+         * Re-read after acquiring the account lock.  A concurrent transaction
+         * that committed just before this lock was acquired must be included
+         * in this reconciliation.
          */
-
-        String reason =
-                explainDecision(
-                        result,
-                        accountEvents
+        List<Event> accountEvents =
+                eventRepository.findByAccountIdOrderByTimestampAscEventIdAsc(
+                        request.accountId()
                 );
+
+        ReconciliationResult result = resolver.resolve(accountEvents);
+
+        jdbcTemplate.update(
+                """
+                UPDATE accounts
+                SET balance = ?,
+                    updated_at = ?,
+                    version = version + 1
+                WHERE account_id = ?
+                """,
+                result.finalBalance(),
+                Timestamp.from(now),
+                request.accountId()
+        );
+
+        String reason = explainDecision(result, accountEvents);
 
         AuditRecord auditRecord =
                 new AuditRecord(
@@ -314,16 +172,13 @@ public class EventService {
 
         auditRecordRepository.save(auditRecord);
 
-        /*
-         * ------------------------------------------------------------
-         * 7. Response
-         * ------------------------------------------------------------
-         */
+        Event persistedEvent = eventRepository.findById(request.eventId())
+                .orElseThrow(() ->
+                        new IllegalStateException(
+                                "Inserted event could not be reloaded: " + request.eventId()
+                        ));
 
-        return new EventResponse(
-                event,
-                result
-        );
+        return new EventResponse(persistedEvent, result);
     }
 
     private String explainDecision(
